@@ -1,19 +1,19 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from dsp.pipeline import process_audio
-from utils.file_handler import save_upload, cleanup_input
+from utils.file_handler import cleanup_input
 from utils.waveform import get_waveform_data
 import os
 import uuid
 import gc
+import base64
 import librosa
-import numpy as np
 
 router = APIRouter()
 
 # Hard limits to protect the 512MB Render free tier
-MAX_FILE_BYTES    = 15 * 1024 * 1024   # 15 MB upload limit
-MAX_DURATION_SECS = 300                 # 5 minutes max audio length
+MAX_FILE_BYTES    = 15 * 1024 * 1024  # 15 MB upload limit
+MAX_DURATION_SECS = 300               # 5 minutes max audio length
 
 @router.post("/process/")
 async def process_audio_route(
@@ -25,29 +25,28 @@ async def process_audio_route(
     reverb:   float = Form(0.0),
     loudness: float = Form(0.0),
 ):
-    # ── Validate file type ──────────────────────────────────────────────────
+    # ── Validate file type ─────────────────────────────────────────────────
     allowed = ["audio/wav", "audio/wave", "audio/mpeg", "audio/mp3", "audio/x-wav"]
     filename = audio.filename or ""
     if audio.content_type not in allowed and not filename.endswith((".wav", ".mp3")):
         raise HTTPException(status_code=400, detail="Only WAV and MP3 files are supported.")
 
-    # ── Validate file size before reading ──────────────────────────────────
-    # Read in chunks to check size without loading entire file into RAM first
+    # ── Read file in chunks, enforce size limit ────────────────────────────
     chunks = []
     total = 0
     while True:
-        chunk = await audio.read(64 * 1024)  # 64KB chunks
+        chunk = await audio.read(64 * 1024)
         if not chunk:
             break
         total += len(chunk)
         if total > MAX_FILE_BYTES:
             raise HTTPException(
                 status_code=400,
-                detail=f"File too large. Maximum allowed size is {MAX_FILE_BYTES // (1024*1024)}MB."
+                detail=f"File too large. Maximum allowed size is {MAX_FILE_BYTES // (1024 * 1024)}MB."
             )
         chunks.append(chunk)
     file_bytes = b"".join(chunks)
-    del chunks  # free chunk list immediately
+    del chunks
     gc.collect()
 
     # ── Clamp parameters ───────────────────────────────────────────────────
@@ -58,20 +57,20 @@ async def process_audio_route(
     reverb   = max(0.0,   min(100.0, reverb))
     loudness = max(-20.0, min(20.0,  loudness))
 
-    # ── Save uploaded file ─────────────────────────────────────────────────
-    uid = str(uuid.uuid4())[:8]
-    ext = os.path.splitext(filename)[1] or ".wav"
-    input_path  = f"media/input_{uid}{ext}"
-    output_path = f"media/output_{uid}.wav"
+    # ── Write input to a temp file (librosa needs a file path) ────────────
+    uid        = str(uuid.uuid4())[:8]
+    ext        = os.path.splitext(filename)[1] or ".wav"
+    input_path = f"/tmp/input_{uid}{ext}"
+    output_path = f"/tmp/output_{uid}.wav"
 
-    os.makedirs("media", exist_ok=True)
+    os.makedirs("/tmp", exist_ok=True)
     with open(input_path, "wb") as f:
         f.write(file_bytes)
-    del file_bytes  # free raw bytes — no longer needed
+    del file_bytes
     gc.collect()
 
     try:
-        # ── Load audio (mono only — halves RAM for stereo files) ───────────
+        # ── Load audio ─────────────────────────────────────────────────────
         y, sr = librosa.load(input_path, sr=None, mono=True)
 
         # ── Validate duration ──────────────────────────────────────────────
@@ -82,16 +81,13 @@ async def process_audio_route(
                 detail=f"Audio too long. Maximum allowed duration is {MAX_DURATION_SECS // 60} minutes."
             )
 
-        # ── Capture original waveform data BEFORE processing ──────────────
-        # Store only the 200-point summary — not the full array
-        original_waveform  = get_waveform_data(y)
-        duration_original  = round(duration, 2)
+        # ── Capture original waveform summary before pipeline mutates y ───
+        original_waveform = get_waveform_data(y)
+        duration_original = round(duration, 2)
 
         # ── Run DSP pipeline ───────────────────────────────────────────────
-        # Pass y directly — no .copy(). Pipeline overwrites y stage by stage.
-        # Original waveform is already captured above so we don't need it anymore.
         y_processed = process_audio(
-            y=y,           # no .copy() — saves one full array worth of RAM
+            y=y,
             sr=sr,
             pitch=pitch,
             speed=speed,
@@ -102,19 +98,24 @@ async def process_audio_route(
             output_path=output_path,
         )
 
-        # ── Free original array — we only need processed from here ────────
         del y
         gc.collect()
 
-        # ── Build response ─────────────────────────────────────────────────
+        # ── Collect response data from processed array ─────────────────────
         processed_waveform = get_waveform_data(y_processed)
         duration_processed = round(len(y_processed) / sr, 2)
 
-        del y_processed  # free processed array — it's written to disk already
+        del y_processed
         gc.collect()
 
+        # ── Read the written WAV file and encode as base64 ─────────────────
+        # This way the audio travels in the JSON response itself.
+        # No persistent disk needed — survives Render restarts and cold starts.
+        with open(output_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
         return JSONResponse({
-            "url":                f"/media/output_{uid}.wav",
+            "audio_b64":          audio_b64,        # base64-encoded WAV
             "filename":           f"output_{uid}.wav",
             "original_waveform":  original_waveform,
             "processed_waveform": processed_waveform,
@@ -124,11 +125,13 @@ async def process_audio_route(
         })
 
     except HTTPException:
-        raise  # re-raise our own validation errors as-is
+        raise
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
     finally:
+        # Clean up both input and output temp files
         cleanup_input(input_path)
-        gc.collect()  # always sweep on exit
+        cleanup_input(output_path)
+        gc.collect()
