@@ -2,7 +2,6 @@
 
 > Premium Audio Digital Signal Processing Engine  
 > Built with FastAPI · Librosa · NumPy · SciPy
-
 ---
 
 ## Overview
